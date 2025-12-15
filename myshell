@@ -1,0 +1,221 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include "parser.h"
+#include <fcntl.h>
+#include <errno.h>
+
+void exitshell()
+{
+    exit(0);
+}
+
+void cdshell(char *path)
+{
+    char *dir;
+    char buffer[1024]; // Buffer para guardar la ruta actual
+    if (path == NULL)
+    {
+        dir = getenv("HOME");
+    }
+    else
+    {
+        dir = path;
+    }
+    if (chdir(dir) != 0)
+    {
+        fprintf(stderr, "No existe el fichero o directorio <%s>\n", dir);
+    }
+    else
+    {
+        if (getcwd(buffer, sizeof(buffer)) != NULL)
+        {
+            printf("%s\n", buffer);
+        }
+    }
+}
+void jobshell()
+{
+}
+void bgshell()
+{
+}
+
+void zombies()
+{
+    pid_t pid;
+    int status;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+    {
+        /*Espera a que un proceso haya terminado, si ha terminado algun proceso
+        tiene que comprpbar cual es, recorrer los jobs, buscar si algun proceso
+        de ese jobsha terminado, y si ha terminado lo marca como terminado y tienen
+        que comprobar si para ese job todos los procesos han terminado y si no ha
+        terminado es que tienes que esperar, solo compruebas que los procesos hayan terminado*/
+    }
+}
+
+void umaskshell()
+{
+}
+// cuando creas un job siempre lo mandas la back, pero si es del fr vas a esperar hassta que termine
+void sigtstp_handler() // hacer que solo se haga signtstp con los del foreground
+{
+    write(STDOUT_FILENO, "\nmsh> ", 6);
+}
+void sigint_handler()
+{
+    write(STDOUT_FILENO, "\nmsh> ", 6);
+}
+void activarsignal()
+{
+    signal(SIGINT, sigint_handler);
+    signal(SIGTSTP, sigtstp_handler);
+}
+
+int aplicar_redirecciones(tline *line, int cmd_index)
+{
+    int fd;
+    if (cmd_index == 0 && line->redirect_input != NULL)
+    {
+        fd = open(line->redirect_input, O_RDONLY);
+        if (fd == -1)
+        {
+            fprintf(stderr, "%s: Error. %s\n",
+                    line->redirect_input, strerror(errno));
+            return -1;
+        }
+
+        if (dup2(fd, STDIN_FILENO) == -1)
+        {
+            fprintf(stderr, "Error en dup2: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        close(fd);
+    }
+    if (cmd_index == line->ncommands - 1 && line->redirect_output != NULL)
+    {
+        fd = open(line->redirect_output, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd == -1)
+        {
+            fprintf(stderr, "%s: Error. %s\n",
+                    line->redirect_output, strerror(errno));
+            return -1;
+        }
+
+        if (dup2(fd, STDOUT_FILENO) == -1)
+        {
+            fprintf(stderr, "Error en dup2: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        close(fd);
+    }
+    if (cmd_index == line->ncommands - 1 && line->redirect_error != NULL)
+    {
+        fd = open(line->redirect_error, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd == -1)
+        {
+            fprintf(stderr, "%s: Error. %s\n",
+                    line->redirect_error, strerror(errno));
+            return -1;
+        }
+
+        if (dup2(fd, STDERR_FILENO) == -1)
+        {
+            fprintf(stderr, "Error en dup2: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        close(fd);
+    }
+
+    return 0;
+}
+
+int ejecutar_comando(tline *line, int background)
+{
+    // comprobar si el comando existe lo mandas al execv
+    if (line->ncommands == 1 && line->commands[0].argv[0] != NULL && strcmp(line->commands[0].argv[0], "exit") == 0)
+    {
+        exitshell();
+        return 0;
+    }
+    if (line->commands[0].argv[0] != NULL && strcmp(line->commands[0].argv[0], "cd") == 0)
+    {
+        cdshell(line->commands[0].argv[1]);
+        return 0;
+        printf("comando cd\n");
+    }
+
+    /* Ejecutar primer (o único) comando de la línea. Más adelante se
+       implementarán pipelines y demás. */
+    tcommand *cmd = &line->commands[0];
+    if (cmd->filename == NULL)
+    {
+        fprintf(stderr, "%s: No se encuentra el mandato\n", cmd->argv[0] ? cmd->argv[0] : "(null)");
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("Error del fork");
+        return -1;
+    }
+    else if (pid == 0)
+    {
+        // Proceso hijo
+        aplicar_redirecciones(line, 0);
+        execvp(cmd->filename, cmd->argv);
+        perror("comando fallido");
+        exit(EXIT_FAILURE);
+    }
+    else
+    {
+        int status = 0;
+        if (background)
+        {
+            printf("[%d]\n", (int)pid);
+        }
+        else
+        {
+            waitpid(pid, &status, 0);
+        }
+        return status;
+    }
+}
+
+int main()
+{
+
+    char buffer[1024];
+    tline *line;
+    activarsignal();
+    while (1)
+    {
+        printf("msh> ");
+        if (fgets(buffer, sizeof(buffer), stdin) == NULL)
+        {
+            break; // Salir si hay un error o EOF
+        }
+        line = tokenize(buffer);
+        if (line == NULL)
+        {
+            continue; // Si la línea es NULL, continuar con la siguiente iteración
+        }
+
+        ejecutar_comando(line, line->background);
+
+        // Aquí puedes agregar el código para ejecutar los comandos tokenizados
+
+        // Liberar la memoria asignada para 'line' si es necesario
+        // free_line(line); // Implementa esta función según tu estructura de datos
+    }
+    return 0;
+}
