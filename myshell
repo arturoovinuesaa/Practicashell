@@ -21,6 +21,7 @@ typedef struct {
     int id;             // ID del job (1, 2, 3...)
     char *command;      // Comando completo
     char status[20];    // Estado (Running, Stopped, Done)
+    int nprocs;         // Number of processes in this job
 } job_t;
 
 job_t jobs_list[MAX_JOBS];
@@ -31,6 +32,7 @@ void init_jobs() {
     for (int i = 0; i < MAX_JOBS; i++) {
         jobs_list[i].pgid = 0;
         jobs_list[i].command = NULL;
+        jobs_list[i].nprocs = 0;
     }
 }
 
@@ -68,13 +70,15 @@ char* get_command_string(tline *line) {
 }
 
 // Añadir un job a la lista
-void add_job(pid_t pgid, char *cmd, char *status) {
+void add_job(pid_t pgid, char *cmd, char *status, int nprocs) {
     for (int i = 0; i < MAX_JOBS; i++) {
         if (jobs_list[i].pgid == 0) { // Hueco libre
             jobs_list[i].pgid = pgid;
             jobs_list[i].id = ++job_counter;
             jobs_list[i].command = cmd; 
-            strcpy(jobs_list[i].status, status);
+            jobs_list[i].nprocs = nprocs;
+            strncpy(jobs_list[i].status, status, sizeof(jobs_list[i].status) - 1);
+            jobs_list[i].status[sizeof(jobs_list[i].status) - 1] = '\0';
             // Imprimir [PGID] para jobs en background (sin job_id)
             if (strcmp(status, RUNNING) == 0) {
                 printf("[%d] %d\n", jobs_list[i].id, pgid);
@@ -129,9 +133,20 @@ job_t* get_last_stopped_job() {
 
 void exitshell()
 {
+    // Send SIGTERM to all active jobs
     for (int i = 0; i < MAX_JOBS; i++) {
-        if (jobs_list[i].command != NULL) free(jobs_list[i].command);
+        if (jobs_list[i].pgid != 0) {
+            kill(-jobs_list[i].pgid, SIGTERM);
+        }
     }
+    
+    // Free all dynamic memory
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (jobs_list[i].command != NULL) {
+            free(jobs_list[i].command);
+        }
+    }
+    
     exit(0);
 }
 
@@ -163,10 +178,35 @@ void cdshell(char *path)
 }
 void jobshell()
 {
+    // Find the current job (highest ID or most recent)
+    int current_id = -1;
+    int previous_id = -1;
+    int max_id = 0;
+    
+    // First pass: find the two highest IDs
     for (int i = 0; i < MAX_JOBS; i++) {
         if (jobs_list[i].pgid != 0) {
-            printf("[%d]+  %-20s %s\n", 
-                   jobs_list[i].id, jobs_list[i].status, jobs_list[i].command);
+            if (jobs_list[i].id > max_id) {
+                previous_id = max_id;
+                max_id = jobs_list[i].id;
+                current_id = max_id;
+            } else if (jobs_list[i].id > previous_id) {
+                previous_id = jobs_list[i].id;
+            }
+        }
+    }
+    
+    // Second pass: print jobs with proper markers
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (jobs_list[i].pgid != 0) {
+            char marker = ' ';
+            if (jobs_list[i].id == current_id) {
+                marker = '+';
+            } else if (jobs_list[i].id == previous_id) {
+                marker = '-';
+            }
+            printf("[%d]%c  %-20s %s\n", 
+                   jobs_list[i].id, marker, jobs_list[i].status, jobs_list[i].command);
         }
     }
 }
@@ -198,94 +238,92 @@ void bgshell(char *arg)
     }
     
     // Actualizar estado a RUNNING
-    strcpy(job->status, RUNNING);
+    strncpy(job->status, RUNNING, sizeof(job->status) - 1);
+    job->status[sizeof(job->status) - 1] = '\0';
     
     // Mostrar información del job
     printf("[%d]+ %s &\n", job->id, job->command);
 }
 
-void zombies()
-{
-    pid_t pid;
+void zombies() {
     int status;
-    
-    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0)
-    {
-        // Buscar el job que contiene este PID
-        for (int i = 0; i < MAX_JOBS; i++) {
-            if (jobs_list[i].pgid == 0) continue;
+    pid_t result;
+
+    // Iteramos por cada job registrado para ver si sus procesos han cambiado
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (jobs_list[i].pgid == 0) continue; // Saltamos huecos vacíos
+
+        // Usamos el PGID negativo para esperar solo a procesos de ESTE job
+        // Esto evita confundir procesos de distintos jobs
+        while ((result = waitpid(-jobs_list[i].pgid, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
             
-            // Verificar si el PID pertenece a este grupo
-            pid_t pgid_of_pid = getpgid(pid);
-            if (pgid_of_pid == jobs_list[i].pgid) {
-                if (WIFEXITED(status) || WIFSIGNALED(status)) {
-                    // Proceso terminó - verificar si todos los procesos del pipeline terminaron
-                    // Para simplificar, intentamos esperar a más procesos del mismo PGID
-                    pid_t check_pid;
-                    int check_status;
-                    int all_done = 1;
-                    
-                    // Verificar si hay más procesos vivos en este PGID
-                    // Si kill devuelve 0, el grupo aún existe
-                    if (kill(-jobs_list[i].pgid, 0) == 0) {
-                        all_done = 0; // Aún hay procesos vivos
-                    }
-                    
-                    if (all_done) {
-                        // Todos los procesos terminaron - marcar job como Done
-                        strcpy(jobs_list[i].status, DONE);
-                        printf("\n[%d]+  Done                    %s\n", 
-                               jobs_list[i].id, jobs_list[i].command);
-                        // Eliminar el job de la lista
-                        remove_job_by_pgid(jobs_list[i].pgid);
-                    }
-                } else if (WIFSTOPPED(status)) {
-                    // Proceso fue detenido
-                    strcpy(jobs_list[i].status, STOPPED);
-                } else if (WIFCONTINUED(status)) {
-                    // Proceso continuó
-                    strcpy(jobs_list[i].status, RUNNING);
+            if (WIFSTOPPED(status)) {
+                strncpy(jobs_list[i].status, STOPPED, sizeof(jobs_list[i].status) - 1);
+                jobs_list[i].status[sizeof(jobs_list[i].status) - 1] = '\0';
+                printf("[%d]+ Stopped %s\n", jobs_list[i].id, jobs_list[i].command);
+            } 
+            else if (WIFCONTINUED(status)) {
+                strncpy(jobs_list[i].status, RUNNING, sizeof(jobs_list[i].status) - 1);
+                jobs_list[i].status[sizeof(jobs_list[i].status) - 1] = '\0';
+                // Opcional: imprimir que continúa
+            } 
+            else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                jobs_list[i].nprocs--;
+                if (jobs_list[i].nprocs <= 0) {
+                    printf("[%d]+ Done %s\n", jobs_list[i].id, jobs_list[i].command);
+                    remove_job_by_pgid(jobs_list[i].pgid);
+                    break; // El job ya no existe, salimos del while
                 }
-                break;
             }
         }
     }
 }
 
-void umaskshell()
+void umaskshell(char **argv, int has_pipes)
 {
-}
-// cuando creas un job siempre lo mandas la back, pero si es del fr vas a esperar hassta que termine
-void sigtstp_handler(int sig) // hacer que solo se haga signtstp con los del foreground
-{
-    if (fg_pgid > 0) {
-        // Enviar SIGTSTP al grupo de procesos en foreground
-        kill(-fg_pgid, SIGTSTP);
+    // Reject if there are pipes
+    if (has_pipes) {
+        fprintf(stderr, "msh: umask: cannot be used with pipes\n");
+        return;
+    }
+    
+    // No arguments - display current mask
+    if (argv[1] == NULL) {
+        mode_t current_mask = umask(0); // Get current mask
+        umask(current_mask); // Restore it
+        printf("%04o\n", current_mask);
+    } else {
+        // Parse octal argument
+        char *endptr;
+        long new_mask = strtol(argv[1], &endptr, 8);
         
-        // Buscar si el job ya existe en la lista
-        int found = 0;
-        for (int i = 0; i < MAX_JOBS; i++) {
-            if (jobs_list[i].pgid == fg_pgid) {
-                strcpy(jobs_list[i].status, STOPPED);
-                found = 1;
-                printf("\n[%d]+  Stopped                 %s\n",
-                       jobs_list[i].id, jobs_list[i].command);
-                break;
-            }
+        // Validate the input
+        if (*endptr != '\0' || new_mask < 0 || new_mask > 0777) {
+            fprintf(stderr, "msh: umask: %s: octal number out of range\n", argv[1]);
+            return;
         }
         
-        // Si no existe, necesitamos crearlo (pero no tenemos el comando aquí)
-        // La solución correcta es crear el job ANTES en ejecutar_linea
+        // Set new mask
+        umask((mode_t)new_mask);
     }
-    write(STDOUT_FILENO, "msh> ", 5);
+}
+// Signal handler for Ctrl+Z - only sends SIGTSTP to foreground group
+void sigtstp_handler(int sig)
+{
+    if (fg_pgid > 0) {
+        // Send SIGTSTP to the foreground process group
+        kill(-fg_pgid, SIGTSTP);
+        // Do not modify jobs list here - not async-signal-safe
+        // Job creation happens in ejecutar_linea() when WIFSTOPPED is detected
+    }
 }
 void sigint_handler(int sig)
 {
     if (fg_pgid > 0) {
-        // Enviar SIGINT al grupo de procesos en foreground
+        // Send SIGINT to the foreground process group
         kill(-fg_pgid, SIGINT);
     }
-    write(STDOUT_FILENO, "\nmsh> ", 6);
+    // Do not print prompt here - not async-signal-safe
 }
 void activarsignal()
 {
@@ -370,6 +408,10 @@ void ejecutar_linea(tline *line) {
             bgshell(line->commands[0].argv[1]);
             return;
         }
+        if (strcmp(line->commands[0].argv[0], "umask") == 0) {
+            umaskshell(line->commands[0].argv, line->ncommands > 1);
+            return;
+        }
     }
     int i;
     int fd[2];
@@ -417,10 +459,13 @@ void ejecutar_linea(tline *line) {
             }
             // Aplicar redirecciones (tu función)
             if (aplicar_redirecciones(line, i) == -1) exit(1);
+            
             // Ejecutar
             execvp(line->commands[i].argv[0], line->commands[i].argv);
-            // Si execvp falla:
-            fprintf(stderr, "msh: %s: %s\n", line->commands[i].argv[0], strerror(errno));
+            
+            // CORRECCIÓN DEL MENSAJE DE ERROR SEGÚN PDF 
+            // "Si alguno de los mandatos a ejecutar no existe..."
+            printf("%s: No se encuentra el mandato\n", line->commands[i].argv[0]);
             exit(1);
         } else {
             // Establecer el grupo de procesos desde el padre (para evitar race conditions)
@@ -440,13 +485,13 @@ void ejecutar_linea(tline *line) {
             }
         }
     }
-    // Gestión de foreground/background
+    //Gestión de foreground/background
     if (line->background) {
         // Añadir el pipeline completo como un job usando el PGID
         char *cmd_str = get_command_string(line);
-        add_job(pgid, cmd_str, RUNNING);
+        add_job(pgid, cmd_str, RUNNING, line->ncommands);
     } else {
-        // Foreground: crear job temporal para poder manejar Ctrl+Z
+        // Fore ground: crear job temporal para poder manejar Ctrl+Z
         char *cmd_str = get_command_string(line);
         
         fg_pgid = pgid;
@@ -454,24 +499,21 @@ void ejecutar_linea(tline *line) {
         // Esperar al grupo de procesos completo con WUNTRACED para detectar stops
         int status;
         pid_t result;
+        int procs_remaining = line->ncommands;
         
         // Esperar al grupo de procesos completo (todos los del pipeline)
-        while (1) {
+        while (procs_remaining > 0) {
             result = waitpid(-pgid, &status, WUNTRACED);
             
             if (result > 0) {
                 if (WIFSTOPPED(status)) {
                     // Job fue detenido con Ctrl+Z - agregarlo a la lista
-                    add_job(pgid, cmd_str, STOPPED);
+                    add_job(pgid, cmd_str, STOPPED, line->ncommands);
                     fg_pgid = 0;
                     return; // Salir sin liberar cmd_str (el job lo necesita)
                 } else if (WIFEXITED(status) || WIFSIGNALED(status)) {
-                    // Un proceso terminó - verificar si quedan más
-                    if (kill(-pgid, 0) < 0) {
-                        // El grupo ya no existe - todos terminaron
-                        break;
-                    }
-                    // Si quedan procesos, continuar esperando
+                    // Un proceso terminó
+                    procs_remaining--;
                 }
             } else if (result < 0) {
                 // Error o no hay más procesos que esperar
@@ -484,8 +526,18 @@ void ejecutar_linea(tline *line) {
     }
 }
 
+// Free memory allocated for tline structure
+// NOTE: Do NOT free internal fields (argv, filename, redirects)
+// as they belong to the parser library
+void free_line(tline *line) {
+    if (line == NULL) return;
+    // Only free the tline structure itself
+    free(line);
+}
+
 int main()
 {
+
 
     char buffer[1024];
     tline *line;
@@ -502,13 +554,14 @@ int main()
             break; // Salir si hay un error o EOF
         }
         line = tokenize(buffer);
-        if (line == NULL || line->ncommands == 0) continue;
+        if (line == NULL || line->ncommands == 0) {
+            if (line != NULL) free_line(line);
+            continue;
+        }
         ejecutar_linea(line);
 
-        // Aquí puedes agregar el código para ejecutar los comandos tokenizados
-
-        // Liberar la memoria asignada para 'line' si es necesario
-        // free_line(line); // Implementa esta función según tu estructura de datos
+        // Liberar la memoria asignada para 'line'
+        free_line(line);
     }
     return 0;
 }
