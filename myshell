@@ -338,6 +338,11 @@ void sigint_handler()
 }
 void activarsignal()
 {
+    /* Ignorar señales de terminal para que la shell no sea parada al cambiar
+       el proceso en primer plano (SIGTTOU, SIGTTIN). */
+    signal(SIGTTOU, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+
     signal(SIGINT, sigint_handler);
     signal(SIGTSTP, sigtstp_handler);
 }
@@ -498,6 +503,15 @@ void ejecutar_linea(tline *line)
                 // Primer proceso: establecer como líder del grupo
                 pgid = pid;
                 setpgid(pid, pid);
+                /* Si es foreground, dar inmediatamente control del terminal al
+                   nuevo grupo para evitar que el hijo sea parado por SIGTTIN */
+                if (!line->background)
+                {
+                    if (tcsetpgrp(STDIN_FILENO, pgid) < 0)
+                    {
+                        /* Ignorar error */
+                    }
+                }
             }
             else
             {
@@ -541,7 +555,9 @@ void ejecutar_linea(tline *line)
             {
                 if (WIFSTOPPED(status))
                 {
-                    // Job fue detenido con Ctrl+Z - agregarlo a la lista
+                    /* Job fue detenido con Ctrl+Z - devolver control del terminal
+                       a la minishell y agregar el job a la lista */
+                    tcsetpgrp(STDIN_FILENO, getpid());
                     add_job(pgid, cmd_str, STOPPED);
                     fg_pgid = 0;
                     return; // Salir sin liberar cmd_str (el job lo necesita)
@@ -564,6 +580,8 @@ void ejecutar_linea(tline *line)
             }
         }
 
+        /* Restaurar control del terminal a la minishell */
+        tcsetpgrp(STDIN_FILENO, getpid());
         fg_pgid = 0;
         free(cmd_str); // Liberar si el job terminó normalmente
     }
