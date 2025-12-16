@@ -75,7 +75,13 @@ void add_job(pid_t pgid, char *cmd, char *status) {
             jobs_list[i].id = ++job_counter;
             jobs_list[i].command = cmd; 
             strcpy(jobs_list[i].status, status);
-            printf("[%d] %d\n", jobs_list[i].id, pgid);
+            // Imprimir [PGID] para jobs en background (sin job_id)
+            if (strcmp(status, RUNNING) == 0) {
+                printf("[%d] %d\n", jobs_list[i].id, pgid);
+            } else {
+                // Para jobs STOPPED, imprimir con formato diferente
+                printf("[%d]+ %d\n", jobs_list[i].id, pgid);
+            }
             return;
         }
     }
@@ -164,21 +170,85 @@ void jobshell()
         }
     }
 }
-void bgshell()
+void bgshell(char *arg)
 {
+    job_t *job = NULL;
+    
+    // Si se proporciona un argumento, buscamos ese job
+    if (arg != NULL) {
+        int job_id = atoi(arg);
+        job = get_job_by_id(job_id);
+        if (job == NULL) {
+            fprintf(stderr, "msh: bg: %d: no such job\n", job_id);
+            return;
+        }
+    } else {
+        // Sin argumento, buscar el último job parado
+        job = get_last_stopped_job();
+        if (job == NULL) {
+            fprintf(stderr, "msh: bg: current: no such job\n");
+            return;
+        }
+    }
+    
+    // Enviar SIGCONT al grupo de procesos
+    if (kill(-job->pgid, SIGCONT) < 0) {
+        perror("msh: bg: kill");
+        return;
+    }
+    
+    // Actualizar estado a RUNNING
+    strcpy(job->status, RUNNING);
+    
+    // Mostrar información del job
+    printf("[%d]+ %s &\n", job->id, job->command);
 }
 
 void zombies()
 {
     pid_t pid;
     int status;
-    while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+    
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0)
     {
-        /*Espera a que un proceso haya terminado, si ha terminado algun proceso
-        tiene que comprpbar cual es, recorrer los jobs, buscar si algun proceso
-        de ese jobsha terminado, y si ha terminado lo marca como terminado y tienen
-        que comprobar si para ese job todos los procesos han terminado y si no ha
-        terminado es que tienes que esperar, solo compruebas que los procesos hayan terminado*/
+        // Buscar el job que contiene este PID
+        for (int i = 0; i < MAX_JOBS; i++) {
+            if (jobs_list[i].pgid == 0) continue;
+            
+            // Verificar si el PID pertenece a este grupo
+            pid_t pgid_of_pid = getpgid(pid);
+            if (pgid_of_pid == jobs_list[i].pgid) {
+                if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                    // Proceso terminó - verificar si todos los procesos del pipeline terminaron
+                    // Para simplificar, intentamos esperar a más procesos del mismo PGID
+                    pid_t check_pid;
+                    int check_status;
+                    int all_done = 1;
+                    
+                    // Verificar si hay más procesos vivos en este PGID
+                    // Si kill devuelve 0, el grupo aún existe
+                    if (kill(-jobs_list[i].pgid, 0) == 0) {
+                        all_done = 0; // Aún hay procesos vivos
+                    }
+                    
+                    if (all_done) {
+                        // Todos los procesos terminaron - marcar job como Done
+                        strcpy(jobs_list[i].status, DONE);
+                        printf("\n[%d]+  Done                    %s\n", 
+                               jobs_list[i].id, jobs_list[i].command);
+                        // Eliminar el job de la lista
+                        remove_job_by_pgid(jobs_list[i].pgid);
+                    }
+                } else if (WIFSTOPPED(status)) {
+                    // Proceso fue detenido
+                    strcpy(jobs_list[i].status, STOPPED);
+                } else if (WIFCONTINUED(status)) {
+                    // Proceso continuó
+                    strcpy(jobs_list[i].status, RUNNING);
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -186,12 +256,35 @@ void umaskshell()
 {
 }
 // cuando creas un job siempre lo mandas la back, pero si es del fr vas a esperar hassta que termine
-void sigtstp_handler() // hacer que solo se haga signtstp con los del foreground
+void sigtstp_handler(int sig) // hacer que solo se haga signtstp con los del foreground
 {
-    write(STDOUT_FILENO, "\nmsh> ", 6);
+    if (fg_pgid > 0) {
+        // Enviar SIGTSTP al grupo de procesos en foreground
+        kill(-fg_pgid, SIGTSTP);
+        
+        // Buscar si el job ya existe en la lista
+        int found = 0;
+        for (int i = 0; i < MAX_JOBS; i++) {
+            if (jobs_list[i].pgid == fg_pgid) {
+                strcpy(jobs_list[i].status, STOPPED);
+                found = 1;
+                printf("\n[%d]+  Stopped                 %s\n",
+                       jobs_list[i].id, jobs_list[i].command);
+                break;
+            }
+        }
+        
+        // Si no existe, necesitamos crearlo (pero no tenemos el comando aquí)
+        // La solución correcta es crear el job ANTES en ejecutar_linea
+    }
+    write(STDOUT_FILENO, "msh> ", 5);
 }
-void sigint_handler()
+void sigint_handler(int sig)
 {
+    if (fg_pgid > 0) {
+        // Enviar SIGINT al grupo de procesos en foreground
+        kill(-fg_pgid, SIGINT);
+    }
     write(STDOUT_FILENO, "\nmsh> ", 6);
 }
 void activarsignal()
@@ -269,12 +362,20 @@ void ejecutar_linea(tline *line) {
             cdshell(line->commands[0].argv[1]);
             return;
         }
-        // Agrega jobs, fg, bg aquí si son built-ins
+        if (strcmp(line->commands[0].argv[0], "jobs") == 0) {
+            jobshell();
+            return;
+        }
+        if (strcmp(line->commands[0].argv[0], "bg") == 0) {
+            bgshell(line->commands[0].argv[1]);
+            return;
+        }
     }
     int i;
     int fd[2];
     int fd_in = -1; // Descriptor de entrada para el siguiente comando
     pid_t pid;
+    pid_t pgid = 0; // PGID del pipeline (se establece con el PID del primer proceso)
 
     for (i = 0; i < line->ncommands; i++) {
         // Crear pipe si no es el último comando
@@ -290,6 +391,15 @@ void ejecutar_linea(tline *line) {
             perror("fork");
             return;
         } else if (pid == 0) {
+            // Establecer el grupo de procesos
+            if (i == 0) {
+                //crear nuevo grupo de procesos para el primero con su propio PID
+                setpgid(0, 0);
+            } else {
+                //unirse al grupo del primer proceso
+                setpgid(0, pgid);
+            }
+            
             // Restaurar señales por defecto para que el hijo pueda morir con Ctrl+C
             signal(SIGINT, SIG_DFL);
             signal(SIGTSTP, SIG_DFL); 
@@ -313,21 +423,64 @@ void ejecutar_linea(tline *line) {
             fprintf(stderr, "msh: %s: %s\n", line->commands[i].argv[0], strerror(errno));
             exit(1);
         } else {
+            // Establecer el grupo de procesos desde el padre (para evitar race conditions)
+            if (i == 0) {
+                // Primer proceso: establecer como líder del grupo
+                pgid = pid;
+                setpgid(pid, pid);
+            } else {
+                // Procesos subsecuentes: añadir al grupo existente
+                setpgid(pid, pgid);
+            }
+            
             if (fd_in != -1) close(fd_in); // Cerrar el extremo de lectura del pipe anterior
             if (i < line->ncommands - 1) {
                 close(fd[1]); // Cerrar escritura del pipe actual
                 fd_in = fd[0]; // Guardar lectura para la siguiente iteración
             }
-            // Si es background, imprimir PID del último comando
-            if (line->background && i == line->ncommands - 1) {
-                printf("[%d]\n", pid);
-            }
         }
     }
-    if (!line->background) {
-        for (i = 0; i < line->ncommands; i++) {
-            wait(NULL);
+    // Gestión de foreground/background
+    if (line->background) {
+        // Añadir el pipeline completo como un job usando el PGID
+        char *cmd_str = get_command_string(line);
+        add_job(pgid, cmd_str, RUNNING);
+    } else {
+        // Foreground: crear job temporal para poder manejar Ctrl+Z
+        char *cmd_str = get_command_string(line);
+        
+        fg_pgid = pgid;
+        
+        // Esperar al grupo de procesos completo con WUNTRACED para detectar stops
+        int status;
+        pid_t result;
+        
+        // Esperar al grupo de procesos completo (todos los del pipeline)
+        while (1) {
+            result = waitpid(-pgid, &status, WUNTRACED);
+            
+            if (result > 0) {
+                if (WIFSTOPPED(status)) {
+                    // Job fue detenido con Ctrl+Z - agregarlo a la lista
+                    add_job(pgid, cmd_str, STOPPED);
+                    fg_pgid = 0;
+                    return; // Salir sin liberar cmd_str (el job lo necesita)
+                } else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                    // Un proceso terminó - verificar si quedan más
+                    if (kill(-pgid, 0) < 0) {
+                        // El grupo ya no existe - todos terminaron
+                        break;
+                    }
+                    // Si quedan procesos, continuar esperando
+                }
+            } else if (result < 0) {
+                // Error o no hay más procesos que esperar
+                break;
+            }
         }
+        
+        fg_pgid = 0;
+        free(cmd_str); // Liberar si el job terminó normalmente
     }
 }
 
@@ -340,6 +493,9 @@ int main()
     activarsignal();
     while (1)
     {
+        // Actualizar estados de jobs antes de mostrar el prompt
+        zombies();
+        
         printf("msh> ");
         if (fgets(buffer, sizeof(buffer), stdin) == NULL)
         {
