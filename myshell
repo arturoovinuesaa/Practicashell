@@ -198,7 +198,7 @@ void builtin_bg(char *arg) {
   }
 
   if (j == NULL) {
-    fprintf(stderr, "msh: bg: no such job\n");
+    fprintf(stderr, "msh: bg: No hay trabajo\n");
     return;
   }
 
@@ -242,21 +242,16 @@ void builtin_umask(char **argv) {
 
 /* ---------- señales ---------- */
 
-void sigint_handler(int s) {
-  (void)s;
-  write(STDOUT_FILENO, "\nmsh> ", 7);
-}
+void sigint_handler() { write(STDOUT_FILENO, "\nmsh> ", 7); }
 
-void sigtstp_handler(int s) {
-  (void)s;
+void sigtstp_handler() {
   if (fg_pgid > 0) {
     kill(-fg_pgid, SIGTSTP);
   }
   write(STDOUT_FILENO, "\nmsh> ", 7);
 }
 
-void sigchld_handler(int s) {
-  (void)s;
+void sigchld_handler() {
   /* vacía: solo para notificar; recogemos en check_zombies */
 }
 
@@ -322,14 +317,13 @@ void check_zombies(void) {
 }
 
 /* ---------- redirecciones ---------- */
-
 int apply_redirs(tline *l, int pos_cmd) {
   int fd;
 
   if (pos_cmd == 0 && l->redirect_input) {
     fd = open(l->redirect_input, O_RDONLY);
     if (fd < 0) {
-      fprintf(stderr, "%s: %s\n", l->redirect_input, strerror(errno));
+      fprintf(stderr, "%s: error de entrada\n", l->redirect_input);
       return -1;
     }
     dup2(fd, STDIN_FILENO);
@@ -339,7 +333,7 @@ int apply_redirs(tline *l, int pos_cmd) {
   if (pos_cmd == l->ncommands - 1 && l->redirect_output) {
     fd = open(l->redirect_output, O_CREAT | O_WRONLY | O_TRUNC, 0666);
     if (fd < 0) {
-      fprintf(stderr, "%s: %s\n", l->redirect_output, strerror(errno));
+      fprintf(stderr, "%s: error de salida\n", l->redirect_output);
       return -1;
     }
     dup2(fd, STDOUT_FILENO);
@@ -349,7 +343,7 @@ int apply_redirs(tline *l, int pos_cmd) {
   if (pos_cmd == l->ncommands - 1 && l->redirect_error) {
     fd = open(l->redirect_error, O_CREAT | O_WRONLY | O_TRUNC, 0666);
     if (fd < 0) {
-      fprintf(stderr, "%s: %s\n", l->redirect_error, strerror(errno));
+      fprintf(stderr, "%s: error de redirección\n", l->redirect_error);
       return -1;
     }
     dup2(fd, STDERR_FILENO);
@@ -434,7 +428,8 @@ void execute_line(tline *l) {
       }
 
       execvp(l->commands[i].argv[0], l->commands[i].argv);
-      fprintf(stderr, "%s: comando no encontrado\n", l->commands[i].argv[0]);
+      fprintf(stderr, "%s: No se encuentra el comando\n",
+              l->commands[i].argv[0]);
       exit(1);
     }
 
