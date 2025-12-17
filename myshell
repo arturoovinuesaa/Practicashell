@@ -108,7 +108,7 @@ void add_job(pid_t pgid, pid_t leader_pid, char *cmd, const char *status)
             jobs[i].command = cmd; /* Asume que cmd ya es memoria reservada */
             strncpy(jobs[i].status, status, sizeof(jobs[i].status));
             /* Formato salida background: [id] pid */
-            printf("[%d] %d\n", jobs[i].id, pgid);
+            printf("\n[%d]+ Stopped    %s\n", jobs[i].id, jobs[i].command);
             return;
         }
     }
@@ -259,7 +259,7 @@ void sigint_handler()
 {
     /* Solo salta de línea. El kernel envía SIGINT al grupo FG automáticamente
        si tcsetpgrp está bien configurado, o nosotros lo hacemos. */
-    printf("\n");
+    write(STDOUT_FILENO, "\nmsh> ", 7);
     /* No reimprimimos el prompt aquí para no ensuciar la salida si hay FG */
 }
 
@@ -268,7 +268,7 @@ void sigtstp_handler()
 
     if (fg_pgid > 0)
         kill(-fg_pgid, SIGTSTP); // reenviar Ctrl-Z al job FG
-    write(STDOUT_FILENO, "\n", 1);
+    write(STDOUT_FILENO, "\nmsh> ", 7);
 }
 
 /* El handler de CHLD debe ser mínimo para evitar race conditions con malloc/free */
@@ -535,7 +535,6 @@ int main(void)
 {
     char buf[1024];
     tline *line;
-
     init_jobs();
     setup_signals();
 
