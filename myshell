@@ -480,10 +480,9 @@ void execute_line(tline *l) {
 
 /* ---------- main ---------- */
 
-int main(void) {
+int main() {
   char buf[1024];
   tline *line;
-
   init_jobs();
   setup_signals();
 
@@ -491,18 +490,14 @@ int main(void) {
     check_zombies();
     printf("msh> ");
     fflush(stdout);
-
     if (!fgets(buf, sizeof(buf), stdin)) {
       break;
     }
-
     line = tokenize(buf);
     if (!line || line->ncommands == 0) {
       continue;
     }
-
     execute_line(line);
   }
-
   return 0;
 }
