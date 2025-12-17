@@ -1,47 +1,457 @@
-#include <stdio.h>
+
 
 #include "parser.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
-int main(void)
-{
-	char buf[1024];
-	tline *line;
-	int i, j;
+#define _GNU_SOURCE
+#define MAX_JOBS 100
+#define RUNNING "Running"
+#define STOPPED "Stopped"
+#define DONE "Done"
 
-	printf("==> ");
-	while (fgets(buf, 1024, stdin))
-	{
+/* =====================
+   ESTRUCTURAS DE JOBS
+   ===================== */
 
-		line = tokenize(buf);
-		if (line == NULL)
-		{
-			continue;
-		}
-		if (line->redirect_input != NULL)
-		{
-			printf("redirección de entrada: %s\n", line->redirect_input);
-		}
-		if (line->redirect_output != NULL)
-		{
-			printf("redirección de salida: %s\n", line->redirect_output);
-		}
-		if (line->redirect_error != NULL)
-		{
-			printf("redirección de error: %s\n", line->redirect_error);
-		}
-		if (line->background)
-		{
-			printf("comando a ejecutarse en background\n");
-		}
-		for (i = 0; i < line->ncommands; i++)
-		{
-			printf("orden %d (%s):\n", i, line->commands[i].filename);
-			for (j = 0; j < line->commands[i].argc; j++)
-			{
-				printf("  argumento %d: %s\n", j, line->commands[i].argv[j]);
-			}
-		}
-		printf("==> ");
-	}
-	return 0;
+typedef struct {
+  pid_t leader_pid;
+  pid_t pgid;
+  int id;
+  char *command;
+  char status[16];
+} job_t;
+
+static job_t jobs[MAX_JOBS];
+static int next_job_id = 1;
+/* No necesitamos fg_pgid global si gestionamos bien el waitpid local,
+   pero lo mantenemos para las señales si fuera necesario */
+static pid_t fg_pgid = 0;
+
+/* =====================
+   UTILIDADES DE JOBS
+   ===================== */
+
+void init_jobs(void) {
+  int i;
+  for (i = 0; i < MAX_JOBS; i++) {
+    jobs[i].pgid = 0;
+    jobs[i].command = NULL;
+    jobs[i].leader_pid = 0;
+  }
+}
+
+/* Construye string del mandato para mostrar en jobs */
+char *build_command(tline *line) {
+  int i, j, len = 0;
+  char *cmd;
+
+  for (i = 0; i < line->ncommands; i++) {
+    for (j = 0; line->commands[i].argv[j]; j++)
+      len += strlen(line->commands[i].argv[j]) + 1;
+    if (i < line->ncommands - 1)
+      len += 3; /* " | " */
+  }
+  if (line->background)
+    len += 2; /* & */
+
+  cmd = malloc(len + 1);
+  if (!cmd)
+    return NULL;
+  cmd[0] = '\0';
+
+  for (i = 0; i < line->ncommands; i++) {
+    if (i > 0)
+      strcat(cmd, "| ");
+    for (j = 0; line->commands[i].argv[j]; j++) {
+      strcat(cmd, line->commands[i].argv[j]);
+      strcat(cmd, " ");
+    }
+  }
+  if (line->background)
+    strcat(cmd, "&");
+
+  return cmd;
+}
+
+void add_job(pid_t pgid, pid_t leader_pid, char *cmd, const char *status) {
+  int i;
+  for (i = 0; i < MAX_JOBS; i++) {
+    if (jobs[i].pgid == 0) {
+      jobs[i].pgid = pgid;
+      jobs[i].leader_pid = leader_pid;
+      jobs[i].id = next_job_id++;
+      jobs[i].command = cmd; /* Asume que cmd ya es memoria reservada */
+      strncpy(jobs[i].status, status, sizeof(jobs[i].status));
+      /* Formato salida background: [id] pid */
+      printf("\n[%d]+ %s    %s\n", jobs[i].id, jobs[i].status, jobs[i].command);
+
+      return;
+    }
+  }
+  fprintf(stderr, "msh: job list full\n");
+  if (cmd)
+    free(cmd);
+}
+
+void remove_job(int index) {
+  if (index >= 0 && index < MAX_JOBS && jobs[index].pgid) {
+    if (jobs[index].command) {
+      free(jobs[index].command);
+      jobs[index].command = NULL;
+    }
+    jobs[index].pgid = 0;
+  }
+}
+
+job_t *find_job_by_id(int id) {
+  int i;
+  for (i = 0; i < MAX_JOBS; i++)
+    if (jobs[i].pgid && jobs[i].id == id)
+      return &jobs[i];
+  return NULL;
+}
+job_t *find_job_by_pgid(pid_t pgid) {
+  int i;
+  for (i = 0; i < MAX_JOBS; i++)
+    if (jobs[i].pgid == pgid)
+      return &jobs[i];
+  return NULL;
+}
+
+job_t *last_stopped_job(void) {
+  int i;
+  job_t *res = NULL;
+  for (i = 0; i < MAX_JOBS; i++) {
+    if (jobs[i].pgid && strcmp(jobs[i].status, STOPPED) == 0) {
+      /* Asumimos que el ID más alto es el último */
+      if (!res || jobs[i].id > res->id)
+        res = &jobs[i];
+    }
+  }
+  return res;
+}
+/* =====================
+   BUILT-INS
+   ===================== */
+
+void builtin_cd(char *path) {
+  char cwd[1024];
+  if (!path)
+    path = getenv("HOME");
+
+  if (chdir(path) < 0) {
+    perror("msh: cd");
+  } else {
+    /* El enunciado pide ruta absoluta al hacer cd sin args */
+    if (getcwd(cwd, sizeof(cwd)))
+      printf("%s\n", cwd);
+  }
+}
+
+void builtin_jobs(void) {
+  int i;
+  for (i = 0; i < MAX_JOBS; i++) {
+    if (jobs[i].pgid) {
+      /* Formato similar al sistema: [id]+ Status Command */
+      printf("[%d]+ %-10s %s\n", jobs[i].id, jobs[i].status, jobs[i].command);
+    }
+  }
+}
+
+void builtin_bg(char *arg) {
+  job_t *job;
+
+  if (arg)
+    job = find_job_by_id(atoi(arg));
+  else
+    job = last_stopped_job();
+
+  if (!job) {
+    fprintf(stderr, "msh: bg: no such job\n");
+    return;
+  }
+
+  if (strcmp(job->status, STOPPED) != 0) {
+    fprintf(stderr, "msh: bg: job already running\n");
+    return;
+  }
+
+  /* Enviamos SIGCONT al grupo entero */
+  kill(-job->pgid, SIGCONT);
+  strcpy(job->status, RUNNING);
+  printf("[%d]+ %s &\n", job->id, job->command);
+}
+
+void builtin_umask(char **argv) {
+  mode_t m;
+  char *end;
+  long val;
+
+  if (!argv[1]) {
+    /* Para ver la máscara actual, umask devuelve la vieja */
+    m = umask(0);
+    umask(m); /* La restauramos */
+    printf("%04o\n", m);
+  } else {
+    val = strtol(argv[1], &end, 8);
+    if (*end || val < 0 || val > 0777) {
+      fprintf(stderr, "msh: umask: invalid value\n");
+      return;
+    }
+    umask((mode_t)val);
+  }
+}
+/* =====================
+   SEÑALES Y GESTIÓN
+   ===================== */
+
+void sigint_handler() {
+  /* Solo salta de línea. El kernel envía SIGINT al grupo FG automáticamente
+     si tcsetpgrp está bien configurado, o nosotros lo hacemos. */
+  write(STDOUT_FILENO, "\nmsh> ", 7);
+  /* No reimprimimos el prompt aquí para no ensuciar la salida si hay FG */
+}
+
+void sigtstp_handler() {
+
+  if (fg_pgid > 0)
+    kill(-fg_pgid, SIGTSTP); // reenviar Ctrl-Z al job FG
+  write(STDOUT_FILENO, "\nmsh> ", 7);
+}
+
+/* El handler de CHLD debe ser mínimo para evitar race conditions con
+ * malloc/free */
+void sigchld_handler(int sig) {
+  (void)sig;
+  /* Dejamos que check_zombies haga el trabajo sucio en el main loop */
+}
+
+void setup_signals(void) {
+  signal(SIGINT, sigint_handler);
+  signal(SIGTSTP, sigtstp_handler);
+  signal(SIGCHLD, sigchld_handler);
+  /* Ignoramos TTOU/TTIN para poder hacer tcsetpgrp sin que nos paren */
+  signal(SIGTTOU, SIG_IGN);
+  signal(SIGTTIN, SIG_IGN);
+}
+
+/* Función segura llamada desde el main loop para limpiar procesos background */
+void check_zombies(void) {
+  int status, i;
+  pid_t pid;
+
+  /* WNOHANG para no bloquear el shell */
+  while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
+    for (i = 0; i < MAX_JOBS; i++) {
+      if (getpgid(pid) == jobs[i].pgid) { // Hemos encontrado el líder del grupo
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+          printf("[%d]+  Done                    %s\n", jobs[i].id,
+                 jobs[i].command);
+          remove_job(i);
+        } else if (WIFSTOPPED(status)) {
+          strcpy(jobs[i].status, STOPPED);
+          printf("[%d]+  Stopped                 %s\n", jobs[i].id,
+                 jobs[i].command);
+        } else if (WIFCONTINUED(status)) {
+          strcpy(jobs[i].status, RUNNING);
+        }
+        break;
+      }
+    }
+  }
+}
+/* =====================
+   EJECUCIÓN
+   ===================== */
+
+/* Función auxiliar para redirecciones (sin cambios lógicos, solo variables) */
+int apply_redirs(tline *l, int i) {
+  int fd;
+
+  if (i == 0 && l->redirect_input) {
+    fd = open(l->redirect_input, O_RDONLY);
+    if (fd < 0) {
+      fprintf(stderr, "%s: Error. %s\n", l->redirect_input, strerror(errno));
+      return -1;
+    }
+    dup2(fd, STDIN_FILENO);
+    close(fd);
+  }
+
+  if (i == l->ncommands - 1 && l->redirect_output) {
+    fd = open(l->redirect_output, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    if (fd < 0) {
+      fprintf(stderr, "%s: Error. %s\n", l->redirect_output, strerror(errno));
+      return -1;
+    }
+    dup2(fd, STDOUT_FILENO);
+    close(fd);
+  }
+
+  if (i == l->ncommands - 1 && l->redirect_error) {
+    fd = open(l->redirect_error, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    if (fd < 0) {
+      fprintf(stderr, "%s: Error. %s\n", l->redirect_error, strerror(errno));
+      return -1;
+    }
+    dup2(fd, STDERR_FILENO);
+    close(fd);
+  }
+  return 0;
+}
+
+void execute_line(tline *l) {
+  int i, fd[2], in = -1;
+  pid_t pid, pgid = 0;
+  int status;
+  char *bg_cmd_copy;
+
+  /* Mandatos internos sin pipes */
+  if (l->ncommands == 1) {
+    if (!strcmp(l->commands[0].argv[0], "exit"))
+      exit(0);
+    if (!strcmp(l->commands[0].argv[0], "cd")) {
+      builtin_cd(l->commands[0].argv[1]);
+      return;
+    }
+    if (!strcmp(l->commands[0].argv[0], "jobs")) {
+      builtin_jobs();
+      return;
+    }
+    if (!strcmp(l->commands[0].argv[0], "bg")) {
+      builtin_bg(l->commands[0].argv[1]);
+      return;
+    }
+    if (!strcmp(l->commands[0].argv[0], "umask")) {
+      builtin_umask(l->commands[0].argv);
+      return;
+    }
+  }
+
+  for (i = 0; i < l->ncommands; i++) {
+    if (i < l->ncommands - 1) {
+      if (pipe(fd) < 0) {
+        perror("pipe");
+        exit(1);
+      }
+    }
+
+    pid = fork();
+    if (pid < 0) {
+      perror("fork");
+      exit(1);
+    }
+
+    if (pid == 0) { /* HIJO */
+      /* Restaurar acción por defecto para señales en foreground/hijos */
+      signal(SIGINT, SIG_DFL);
+      signal(SIGTSTP, SIG_DFL);
+      signal(SIGCHLD, SIG_DFL);
+
+      /* Gestión de grupos de procesos */
+      if (i == 0)
+        pgid = getpid();
+      setpgid(0, pgid);
+
+      /* Redirección pipes */
+      if (in != -1) {
+        dup2(in, STDIN_FILENO);
+        close(in);
+      }
+      if (i < l->ncommands - 1) {
+        dup2(fd[1], STDOUT_FILENO);
+        close(fd[0]);
+        close(fd[1]);
+      }
+
+      /* Redirecciones de archivo */
+      if (apply_redirs(l, i) < 0)
+        exit(1);
+
+      /* Ejecución */
+      execvp(l->commands[i].argv[0], l->commands[i].argv);
+      printf("%s: No se encuentra el mandato\n", l->commands[i].argv[0]);
+      exit(1);
+    }
+
+    /* PADRE */
+    if (i == 0)
+      pgid = pid;
+    setpgid(pid, pgid); /* Evitar race condition setpgid */
+
+    if (in != -1)
+      close(in);
+    if (i < l->ncommands - 1) {
+      close(fd[1]);
+      in = fd[0];
+    }
+  }
+
+  /* Gestión Background / Foreground */
+  if (l->background) {
+    bg_cmd_copy = build_command(l);
+    add_job(pgid, pgid, bg_cmd_copy, RUNNING);
+  } else {
+    /* FOREGROUND */
+    fg_pgid = pgid;
+    /* Cedemos el control del terminal al grupo del hijo */
+    tcsetpgrp(STDIN_FILENO, pgid);
+
+    /* Esperamos a TODO el grupo */
+
+    int stopped = 0;
+
+    while (1) {
+      pid = waitpid(-pgid, &status, WUNTRACED);
+      if (pid < 0) {
+        if (errno == ECHILD)
+          break; /* No quedan procesos en el grupo */
+        else
+          continue;
+      }
+
+      if (WIFSTOPPED(status)) {
+        stopped = 1;
+        /* Asegurar que TODO el grupo queda parado */
+        kill(-pgid, SIGTSTP);
+        break;
+      }
+    }
+    /* Recuperar terminal */
+    tcsetpgrp(STDIN_FILENO, getpid());
+    fg_pgid = 0;
+    if (stopped) {
+      bg_cmd_copy = build_command(l);
+      add_job(pgid, pgid, bg_cmd_copy, STOPPED);
+    }
+  }
+}
+int main(void) {
+  char buf[1024];
+  tline *line;
+  init_jobs();
+  setup_signals();
+
+  while (1) {
+
+    check_zombies();
+    printf("msh> ");
+    fflush(stdout);
+    if (!fgets(buf, sizeof(buf), stdin))
+      break;
+    line = tokenize(buf);
+    if (!line | line->ncommands == 0)
+      continue;
+    execute_line(line);
+  }
+  return 0;
 }
